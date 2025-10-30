@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from typing import List
 import requests
 from bs4 import BeautifulSoup
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,18 @@ def extract_price_from_text(text):
     #searches for "$" or one or more digits or a decimal point followed by 1-2 digits
     match = re.search(r"\$?\d+(?:\.\d{1,2})?", text)
     return match.group(0) if match else None
+
+
+@app.post("/scrape-multi")
+def scrape_multiple(urls: List[str]):
+    results = []
+    for url in urls:
+        try:
+            result = scrape(url)  # reusing existing function
+            results.append(result)
+        except Exception as e:
+            results.append({"url": url, "error": str(e)})
+    return {"count": len(results), "results": results}
 
 
 @app.get("/scrape")
@@ -71,7 +84,7 @@ def scrape(url: str = Query(...)):
         except Exception as e:
             print("JSON scrape failed:", e)
 
-    # fallback: HTML scrape with render=true
+    # fallback: HTML scrape with render=true, not working well yet
     try:
         html_resp = requests.get("https://api.scraperapi.com", params={
             "api_key": API_KEY,
