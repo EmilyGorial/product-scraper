@@ -1,0 +1,118 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Product Search</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 1000px;
+      margin: auto;
+      padding: 2rem;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 10px;
+    }
+    button {
+      padding: 8px 16px;
+      margin-bottom: 20px;
+    }
+    .products-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+    }
+    .product-card {
+      border: 1px solid #ccc;
+      padding: 10px;
+      border-radius: 6px;
+      text-align: center;
+      background: #fafafa;
+    }
+    .product-card img {
+      max-width: 100%;
+      height: auto;
+      margin-bottom: 10px;
+    }
+    .product-card h3 {
+      font-size: 1rem;
+      margin: 5px 0;
+      height: 2.4em; 
+      overflow: hidden;
+    }
+    .product-card .price {
+      font-weight: bold;
+      margin-bottom: 5px;
+    }
+    .product-card a {
+      display: inline-block;
+      margin-top: 5px;
+      padding: 5px 10px;
+      background: #007bff;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Product Search</h2>
+  <input id="urlInput" type="text" placeholder="Enter a collection URL">
+  <button onclick="scrape()">Fetch Products</button>
+
+  <div id="products" class="products-grid"></div>
+
+  <script>
+    async function scrape() {
+      const url = document.getElementById("urlInput").value.trim();
+      if (!url) return;
+
+      const productsDiv = document.getElementById("products");
+      productsDiv.innerHTML = "Loading...";
+
+      try {
+        const res = await fetch(`http://localhost:8000/scrape?url=${encodeURIComponent(url)}`);
+        const data = await res.json();
+
+        if (!data.products || data.products.length === 0) {
+          productsDiv.innerHTML = "No products found.";
+          return;
+        }
+
+        productsDiv.innerHTML = "";
+
+        data.products.forEach(p => {
+          const card = document.createElement("div");
+          card.className = "product-card";
+
+          const img = document.createElement("img");
+          img.src = p.image || "https://via.placeholder.com/200x200?text=No+Image";
+          card.appendChild(img);
+
+          const title = document.createElement("h3");
+          title.textContent = p.title || "No title";
+          card.appendChild(title);
+
+          const price = document.createElement("div");
+          price.className = "price";
+          price.textContent = p.price || "Price not available";
+          card.appendChild(price);
+
+          const link = document.createElement("a");
+          link.href = p.link;
+          link.target = "_blank";
+          link.textContent = "View Product";
+          card.appendChild(link);
+
+          productsDiv.appendChild(card);
+        });
+      } catch (err) {
+        productsDiv.innerHTML = "Error fetching products.";
+        console.error(err);
+      }
+    }
+  </script>
+</body>
+</html>
