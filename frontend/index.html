@@ -18,9 +18,7 @@
       padding: 8px 16px;
       margin-bottom: 20px;
     }
-    .site-section {
-      margin-bottom: 40px;
-    }
+    .site-section { margin-bottom: 40px; }
     .site-header {
       font-size: 1.4rem;
       font-weight: bold;
@@ -48,7 +46,7 @@
     .product-card h3 {
       font-size: 1rem;
       margin: 5px 0;
-      height: 2.4em; 
+      height: 2.4em;
       overflow: hidden;
     }
     .product-card .price {
@@ -68,84 +66,152 @@
 </head>
 <body>
   <h2>Product Search</h2>
+
   <input id="url1" type="text" placeholder="Enter first collection URL">
   <input id="url2" type="text" placeholder="Enter second collection URL">
   <input id="url3" type="text" placeholder="Enter third collection URL">
   <input id="url4" type="text" placeholder="Enter fourth collection URL">
-  <button onclick="scrapeMulti()">Fetch Products</button>
+   <button id="fetchBtn" type="button">Fetch Products</button>
+
 
   <div id="results"></div>
+  <pre id="debug" style="background:#f8f8f8;border:1px solid #ccc;padding:10px;max-height:300px;overflow:auto;"></pre>
+
 
   <script>
-    async function scrapeMulti() {
-      const urls = [url1.value, url2.value, url3.value, url4.value].map(u => u.trim()).filter(Boolean);
-      if (urls.length === 0) return alert("Please enter at least one URL.");
+async function scrapeMulti() {
+  const urls = [url1.value, url2.value, url3.value, url4.value]
+    .map(u => u.trim())
+    .filter(Boolean);
+  if (urls.length === 0) {
+    alert("Please enter at least one URL.");
+    return;
+  }
 
-      const resultsDiv = document.getElementById("results");
-      resultsDiv.innerHTML = "Loading...";
+  const resultsDiv = document.getElementById("results");
+  const debugDiv = document.getElementById("debug");
+  debugDiv.textContent = "";
+  resultsDiv.innerHTML = "<p>Loading products...</p>";
 
-      try {
-        const res = await fetch("http://localhost:8000/scrape-multi", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(urls)
-        });
-        const allData = await res.json();
-        resultsDiv.innerHTML = "";
+  try {
+    const res = await fetch("http://localhost:8000/scrape-multi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(urls)
+    });
 
-        (allData.results || []).forEach(site => {
-          const siteSection = document.createElement("div");
-          siteSection.className = "site-section";
+    const rawText = await res.text();
+    const length = rawText.length;
+    debugDiv.textContent = `✅ Received ${length.toLocaleString()} bytes from server.`;
 
-          const siteHeader = document.createElement("div");
-          const domain = new URL(site.url).hostname.replace("www.", "");
-          siteHeader.className = "site-header";
-          siteHeader.textContent = domain;
-          siteSection.appendChild(siteHeader);
-
-          const grid = document.createElement("div");
-          grid.className = "products-grid";
-
-          if (!site.products || site.products.length === 0) {
-            const noData = document.createElement("p");
-            noData.textContent = "No products found.";
-            siteSection.appendChild(noData);
-          } else {
-            site.products.forEach(p => {
-              const card = document.createElement("div");
-              card.className = "product-card";
-
-              const img = document.createElement("img");
-              img.src = p.image || "https://via.placeholder.com/200x200?text=No+Image";
-              card.appendChild(img);
-
-              const title = document.createElement("h3");
-              title.textContent = p.title || "No title";
-              card.appendChild(title);
-
-              const price = document.createElement("div");
-              price.className = "price";
-              price.textContent = p.price || "Price not available";
-              card.appendChild(price);
-
-              const link = document.createElement("a");
-              link.href = p.link;
-              link.target = "_blank";
-              link.textContent = "View Product";
-              card.appendChild(link);
-
-              grid.appendChild(card);
-            });
-            siteSection.appendChild(grid);
-          }
-
-          resultsDiv.appendChild(siteSection);
-        });
-      } catch (err) {
-        console.error(err);
-        resultsDiv.innerHTML = "Error fetching products.";
-      }
+    if (length > 100000) {
+      debugDiv.textContent += "\n⚠️ Response too large, showing first 1 KB only.";
+    } else {
+      debugDiv.textContent += "\nFull response below.";
     }
-  </script>
+
+    // Show just the first 1000 chars
+    debugDiv.textContent += `\nPreview:\n${rawText.slice(0, 1000)}\n...`;
+
+
+    let allData;
+    try {
+      allData = JSON.parse(rawText);
+    } catch (err) {
+      debugDiv.textContent += `\n❌ JSON parse error: ${err.message}`;
+      resultsDiv.innerHTML = "<p style='color:red;'>Invalid JSON received.</p>";
+      return;
+    }
+
+    resultsDiv.innerHTML = "";
+    debugDiv.textContent += `\n✅ Parsed JSON keys: ${Object.keys(allData)}`;
+
+    // Normalize JSON structure
+    let sites = [];
+    if (Array.isArray(allData)) {
+      sites = allData.map(d => ({ url: d.url || urls[0], products: d.products || [] }));
+    } else if (allData.results) {
+      sites = allData.results;
+    } else if (allData.products) {
+      sites = [allData];
+    } else {
+      sites = [{ url: urls[0], products: [] }];
+    }
+
+    let totalCount = 0;
+
+    if (!Array.isArray(sites)) {
+      debugDiv.textContent += "\n❌ Invalid JSON structure — expected array.";
+      return;
+    }
+
+
+    sites.forEach(site => {
+      const siteSection = document.createElement("div");
+      siteSection.className = "site-section";
+
+      const siteHeader = document.createElement("div");
+      const domain = site.url ? new URL(site.url).hostname.replace("www.", "") : "unknown";
+      siteHeader.className = "site-header";
+      siteHeader.textContent = domain;
+      siteSection.appendChild(siteHeader);
+
+      const grid = document.createElement("div");
+      grid.className = "products-grid";
+
+      const products = site.products || [];
+      if (products.length === 0) {
+        const noData = document.createElement("p");
+        noData.textContent = "No products found.";
+        siteSection.appendChild(noData);
+      } else {
+        totalCount += products.length;
+        products.forEach(p => {
+          const card = document.createElement("div");
+          card.className = "product-card";
+
+          const img = document.createElement("img");
+          img.src = p.image || "https://via.placeholder.com/200x200?text=No+Image";
+          card.appendChild(img);
+
+          const title = document.createElement("h3");
+          title.textContent = p.title || "No title";
+          card.appendChild(title);
+
+          const price = document.createElement("div");
+          price.className = "price";
+          price.textContent = p.price || "Price not available";
+          card.appendChild(price);
+
+          const link = document.createElement("a");
+          link.href = p.link;
+          link.target = "_blank";
+          link.textContent = "View Product";
+          card.appendChild(link);
+
+          grid.appendChild(card);
+        });
+        siteSection.appendChild(grid);
+      }
+
+      resultsDiv.appendChild(siteSection);
+    });
+
+    debugDiv.textContent += `\n✅ Rendered ${totalCount} total products successfully.`;
+  } catch (err) {
+    console.error(err);
+    debugDiv.textContent += `\n❌ JS fetch error: ${err.message}`;
+    resultsDiv.innerHTML = "<p style='color:red;'>Error fetching products.</p>";
+  }
+}
+
+// ✅ Attach listener safely after defining scrapeMulti
+document.getElementById("fetchBtn").addEventListener("click", async (e) => {
+  e.preventDefault(); // Prevent page reload
+  await scrapeMulti();
+});
+</script>
+
+
 </body>
 </html>

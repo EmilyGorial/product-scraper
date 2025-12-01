@@ -6,12 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 import os
-import json
 import re
 import asyncio
 import platform
 
-# ensure async works properly on windows
+# ensure async works properly on windows 
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -20,7 +19,7 @@ API_KEY = os.getenv("SCRAPERAPI_KEY")
 
 app = FastAPI()
 
-# cross origin resource sharing
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,15 +28,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# helpers
 def extract_price_from_text(text: str):
-    """Extract the most likely price (not rating) from text."""
+    """Extract the most likely price (not rating) from any text blob."""
     if not text:
         return None
 
-    # normalize whitespace
     text = text.strip()
 
-    # prefer explicit currency symbols first
+    # prefer explicit currency symbols
     currency_pattern = re.compile(
         r"(?:USD|US\$|CA\$|\$|£|€)\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?"
     )
@@ -45,156 +44,179 @@ def extract_price_from_text(text: str):
     if match:
         return match.group(0).strip()
 
-    # Otherwise, match plain numeric prices but avoid ratings
+    # else, match plain numbers but avoid ratings
     generic_pattern = re.compile(r"\d{1,4}(?:,\d{3})*(?:\.\d{1,2})?")
     for m in generic_pattern.finditer(text):
         value = m.group(0)
         try:
             num = float(value.replace(",", ""))
-            # skip typical rating-like numbers
+            # skip rating-like values
             if 0 < num <= 5:
                 continue
-            # skip common patterns like "4.5 stars" or "Rated 4.9"
             span_text = text[m.start():m.end() + 10].lower()
             if any(x in span_text for x in ["star", "rated", "/5", "/10"]):
                 continue
-            return f"${num:.2f}"  # standardize formatting
+            return f"${num:.2f}"
         except ValueError:
             continue
 
     return None
 
-def flatten_products(raw):
-    """Normalize JSON-based product structures from different APIs."""
-    flat = []
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict):
-                flat.append({
-                    "title": item.get("title") or item.get("name"),
-                    "price": extract_price_from_text(
-                        str(item.get("price")) or str(item.get("priceRange", {}).get("min"))
-                    ),
-                    "link": item.get("handle") or item.get("url"),
-                    "image": (
-                        item.get("image", {}).get("src")
-                        or item.get("featured_image", {}).get("url")
-                        or None
-                    )
-                })
-    return flat
-def scrape_with_playwright(url, max_products=60):
-    """Load Gymshark page, extract product cards, and fetch true titles/prices in parallel."""
-    from playwright.sync_api import sync_playwright
-    import concurrent.futures
-    import time
 
+# playwright scraper 
+
+def scrape_with_playwright(url: str, max_products: int = 40):
     products = []
+    seen_links = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=90000)
 
-        print(f"\n--- Navigating to: {url} ---")
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        # allow content to settle a bit
+        page.wait_for_timeout(2000)
 
-        # click cookie consent if exists
-        try:
-            page.wait_for_timeout(2000)
-            consent = page.locator("button:has-text('Continue')")
-            if consent.count() > 0:
-                consent.first.click(timeout=3000)
-                print("clicked cookie consent button")
-        except Exception:
-            print("no cookie banner found or clickable")
+        # scroll to trigger lazy load on many sites
+        for _ in range(4):
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(800)
 
-        # wait for product grid or cards
-        try:
-            page.wait_for_selector(
-                "div[data-test='product-grid'] >> a[data-test='product-card-link'], \
-                .product-tile, .product, a[href*='/product/'], a[href*='/p/']",
-                timeout=20000
-            )
-            print("product grid or tiles rendered")
-        except Exception:
-            print("product grid not found within timeout, proceeding anyway")
-            page.screenshot(path="debug_grid_missing.png", full_page=True)
-            html_dump = page.content()
-            with open("debug_grid_missing.html", "w", encoding="utf-8") as f:
-                f.write(html_dump)
-            print("saved debug_grid_missing.png and debug_grid_missing.html ")
-
-        # proceed even if grid not found 
-        page.wait_for_timeout(3000)  
-        page.mouse.wheel(0, 3000)
-        page.wait_for_timeout(1500)
+        # generic product card heuristics
+        card_selector = (
+            "article, "
+            "li[class*='product'], "
+            "div[class*='product'], "
+            "section[class*='product'], "
+            "div[data-test*='product'], "
+            "li[data-test*='product'],"
+            "div[class*='tile'], "
+            "div[class*='card'], "
+        )
+        card_elements = page.query_selector_all(card_selector)
 
 
-        
-        
-        # scroll to trigger lazy loads
-        for _ in range(6):
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(1500)
-
-        # gather product cards
-        product_cards = page.query_selector_all("a[data-test='product-card-link']")
-        print(f"🛍️ Found {len(product_cards)} product cards")
+        if not card_elements:
+            browser.close()
+            return []
+            
 
         base_domain = url.split("/")[2]
 
-        #basic data collection
-        basic_products = []
-        for idx, card in enumerate(product_cards[:max_products]):
-            title_el = card.query_selector("[data-test='product-card-title']")
-            price_el = card.query_selector("[data-test='product-card-price']")
+        for card in card_elements:
+            if len(products) >= max_products:
+                break
+
+            # link 
+            link_el = card.query_selector(
+                "a[href*='product'], "
+                "a[href*='/products/'], "
+                "a[href*='/product/'], "
+                "a[href*='item'], "
+                "a[href*='shop']"
+            )
+            if not link_el:
+                continue
+
+            href = link_el.get_attribute("href")
+            if not href:
+                continue
+
+            if href.startswith("/"):
+                href = f"https://{base_domain}{href}"
+
+            if href in seen_links:
+                continue
+            seen_links.add(href)
+
+            # image
             img_el = card.query_selector("img")
+            image = None
+            if img_el:
+                for attr in ["src", "data-src", "data-original", "data-srcset"]:
+                    val = img_el.get_attribute(attr)
+                    if not val:
+                        continue
+                    # take first URL
+                    if " " in val or "," in val:
+                        first_part = val.split(",")[0].strip()
+                        image = first_part.split(" ")[0]
+                    else:
+                        image = val
+                    # strip query params for cleanliness
+                    if image:
+                        image = image.split("?")[0]
+                    if image:
+                        break
 
-            title = title_el.inner_text().strip() if title_el else None
-            price = price_el.inner_text().strip() if price_el else None
-            link = card.get_attribute("href")
-            image = img_el.get_attribute("src") if img_el else None
+            # title
+            title = None
 
-            if link and link.startswith("/"):
-                link = f"https://{base_domain}{link}"
+            # 1) h1–h4 inside card
+            heading = card.query_selector("h1, h2, h3, h4")
+            if heading:
+                t = heading.inner_text().strip()
+                if t:
+                    title = t
 
-            basic_products.append({
-                "title": title,
-                "price": price,
-                "link": link,
-                "image": image
-            })
+            # 2) Anything with 'title' or 'name' in class
+            if not title:
+                name_el = card.query_selector(
+                    "[class*='title'], [class*='name'], [data-test*='title']"
+                )
+                if name_el:
+                    t = name_el.inner_text().strip()
+                    if t:
+                        title = t
 
-        print(f"collected {len(basic_products)} base-level product cards")
+            # 3) link aria-label or title attribute
+            if not title:
+                for attr in ["aria-label", "title"]:
+                    t = link_el.get_attribute(attr)
+                    if t:
+                        title = t.strip()
+                        break
 
-        # parallel deep fetch for missing titles
-        def fetch_details(prod):
-            """Fetch accurate title/price from the product page."""
-            if not prod["link"] or (prod["title"] and prod["title"].lower() != "product"):
-                return prod
-            local_page = context.new_page()
-            try:
-                local_page.goto(prod["link"], wait_until="domcontentloaded", timeout=20000)
-                local_page.wait_for_selector("h1", timeout=5000)
-                prod["title"] = local_page.locator("h1").inner_text().strip()
-                prod["price"] = local_page.locator("[data-test='product-price']").inner_text().strip()
-            except Exception:
-                pass
-            finally:
-                local_page.close()
-            return prod
+            # 4) link inner text
+            if not title:
+                t = link_el.inner_text().strip()
+                if t:
+                    title = t
 
-        print("⚙️ Launching parallel detail fetches...")
-        start_time = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            products = list(executor.map(fetch_details, basic_products))
+            # 5) image alt
+            if not title and img_el:
+                alt = img_el.get_attribute("alt")
+                if alt:
+                    title = alt.strip()
 
-        print(f"deep fetches complete in {time.time() - start_time:.1f}s")
-        print(f"extracted {len(products)} final products with accurate titles & prices")
+            # 6) slug from URL
+            if not title and href:
+                slug = href.rstrip("/").split("/")[-1]
+                slug = re.sub(r"[-_]+", " ", slug)
+                slug = slug.strip()
+                if slug:
+                    title = slug.title()
 
-        page.screenshot(path="gymshark_debug.png", full_page=True)
-        print("📸 Saved final debug screenshot: gymshark_debug.png")
+            # price 
+            card_text = card.inner_text() or ""
+            price = extract_price_from_text(card_text)
+
+            if not (title and price and image and href):
+                continue
+
+            # normalize obvious currency symbols
+            if "£" in price:
+                price = price.replace("£", "$")
+
+            products.append(
+                {
+                    "title": title,
+                    "price": price,
+                    "link": href,
+                    "image": image,
+                }
+            )
 
         browser.close()
 
@@ -202,79 +224,139 @@ def scrape_with_playwright(url, max_products=60):
 
 
 
+# multi URL endpoint
+
 @app.post("/scrape-multi")
 def scrape_multiple(urls: List[str]):
+    """
+    Scrape multiple URLs.
+    - Expects JSON body: ["url1", "url2", ...]
+    - Wraps each result in a consistent structure for the frontend.
+    - Trims product lists to avoid huge payloads.
+    """
     results = []
+
     for url in urls:
         try:
-            result = scrape(url)  # reusing existing function
-            results.append(result)
+            data = scrape(url=url)
+
+            if isinstance(data, dict):
+                products = (data.get("products") or [])[:40]
+                results.append(
+                    {
+                        "url": data.get("url", url),
+                        "source": data.get("source", "unknown"),
+                        "count": len(products),
+                        "products": products,
+                    }
+                )
+            else:
+                products = (data or [])[:40]
+                results.append(
+                    {
+                        "url": url,
+                        "source": "unknown_raw",
+                        "count": len(products),
+                        "products": products,
+                    }
+                )
         except Exception as e:
-            results.append({"url": url, "error": str(e)})
+            results.append(
+                {
+                    "url": url,
+                    "error": str(e),
+                    "products": [],
+                }
+            )
+
     return {"count": len(results), "results": results}
 
 
+
+# single URL endpoint
 @app.get("/scrape")
 def scrape(url: str = Query(...)):
-    """Scrape Shopify or JS-rendered collection/product pages."""
+    """
+    Scrape Shopify or static/JS collection/product pages.
+
+    Order:
+      1. Shopify /collections/.../products.json via ScraperAPI
+      2. HTML via ScraperAPI
+      3. Generic Playwright fallback (STRICT mode)
+    """
     domain = url.split("/")[2]
     base = f"https://{domain}"
 
-    # trying Shopify JSON endpoint first
-    # checks if shopify page
+    #1) shopify JSON
     if "/collections/" in url:
         json_url = url.rstrip("/") + "/products.json"
         try:
-            json_resp = requests.get("https://api.scraperapi.com", params={
-                "api_key": API_KEY,
-                "url": json_url,
-                "respect_robots_txt": "true"
-            })
+            json_resp = requests.get(
+                "https://api.scraperapi.com",
+                params={
+                    "api_key": API_KEY,
+                    "url": json_url,
+                    "respect_robots_txt": "true",
+                },
+                timeout=20,
+            )
             if json_resp.status_code == 200:
-                # turn HTTP response body into Python dictionary
                 data = json_resp.json()
-                # check for expected structure
                 if isinstance(data, dict) and "products" in data:
                     products = []
                     for p in data["products"]:
                         title = p.get("title")
-                        # gets price of first variant (specific version of a product)
                         price_val = p.get("variants", [{}])[0].get("price")
                         price = f"${float(price_val):.2f}" if price_val else None
-                        link = f"{base}/products/{p.get('handle')}"
+                        handle = p.get("handle")
+                        link = f"{base}/products/{handle}" if handle else None
                         image = p.get("images", [{}])[0].get("src")
-                        products.append({
-                            "title": title,
-                            "price": price,
-                            "link": link,
-                            "image": image
-                        })
+
+                        if title or price or image:
+                            products.append(
+                                {
+                                    "title": title,
+                                    "price": price,
+                                    "link": link,
+                                    "image": image,
+                                }
+                            )
+
                     if products:
-                        return {"url": url, "source": "collection_json", "count": len(products), "products": products}
-        except Exception as e:
-            print("JSON scrape failed:", e)
+                        return {
+                            "url": url,
+                            "source": "collection_json",
+                            "count": len(products),
+                            "products": products,
+                        }
+        except Exception:
+            pass  
 
-    # fallback: HTML scrape with render=true, not working well yet
+    # 2)HTML via ScraperAPI
+    html_products = []
     try:
-        html_resp = requests.get("https://api.scraperapi.com", params={
-            "api_key": API_KEY,
-            "url": url,
-            "render": "true",
-            "wait": "7000",
-            "country_code": "us",
-            "respect_robots_txt": "true"
-        })
-        # converts raw HTML into searchable tree of tags
-        soup = BeautifulSoup(html_resp.text, "html.parser")
-        # finding all product containers (add more later)
-
-        product_cards = soup.select(
-            "a[href*='/product'], a[href*='/shop/'], div[class*='product'], li[class*='product'], div[class*='card'], div[class*='grid'], article"
+        html_resp = requests.get(
+            "https://api.scraperapi.com",
+            params={
+                "api_key": API_KEY,
+                "url": url,
+                "render": "true",
+                "wait": "7000",
+                "country_code": "us",
+                "respect_robots_txt": "true",
+            },
+            timeout=30,
         )
 
-        products = []
-        seen_links = set()
+        soup = BeautifulSoup(html_resp.text, "html.parser")
 
+        product_cards = soup.select(
+            "a[href*='/product'], a[href*='/shop/'], "
+            "div[class*='product'], li[class*='product'], "
+            "div[class*='card'], div[class*='grid'], article"
+        )
+
+        seen_links = set()
         for card in product_cards:
             link_tag = card.find("a", href=True) or card
             link = link_tag.get("href")
@@ -282,30 +364,29 @@ def scrape(url: str = Query(...)):
                 continue
             seen_links.add(link)
 
-            # if relative URL
             if link.startswith("/"):
                 link = base + link
 
-            title_tag = (card.find("h1") or card.find("h2") or card.find("h3") or card.get("aria-label") or card.get("title"))
-            # title might not be BeautifulSoup tag
-            title = title_tag.get_text(strip=True) if hasattr(title_tag, "get_text") else str(title_tag or "").strip()
+            title_tag = (
+                card.find("h1")
+                or card.find("h2")
+                or card.find("h3")
+                or card.get("aria-label")
+                or card.get("title")
+            )
+            title = (
+                title_tag.get_text(strip=True)
+                if hasattr(title_tag, "get_text")
+                else str(title_tag or "").strip()
+            )
+            if title and title.strip().lower() == "product":
+                title = None
 
             card_text = card.get_text(" ", strip=True)
             price = extract_price_from_text(card_text)
 
-            img_tag = card.find("img")
-            image = img_tag["src"] if img_tag and img_tag.has_attr("src") else None
-
-            if not price:
-                # check for data attributes
-                for attr in ["data-price", "data-sale-price", "data-amount"]:
-                    if card.has_attr(attr):
-                        price = extract_price_from_text(card[attr])
-                        break
-
-            # handle lazy loaded images
-            img_tag = card.find("img")
             image = None
+            img_tag = card.find("img")
             if img_tag:
                 for attr in ["src", "data-src", "data-original", "data-srcset"]:
                     if img_tag.has_attr(attr):
@@ -313,25 +394,37 @@ def scrape(url: str = Query(...)):
                         break
 
             if title or price or image:
-                products.append({
-                    "title": title,
-                    "price": price,
-                    "link": link,
-                    "image": image
-                })
+                html_products.append(
+                    {
+                        "title": title,
+                        "price": price,
+                        "link": link,
+                        "image": image,
+                    }
+                )
 
-        if products:
-            return {"url": url, "source": "collection_html", "count": len(products), "products": products}
+        if html_products:
+            return {
+                "url": url,
+                "source": "collection_html",
+                "count": len(html_products),
+                "products": html_products,
+            }
+    except Exception:
+        pass  
 
-    except Exception as e:
-        print("Rendered scrape failed:", e)
 
-    # --- Final fallback: Playwright ---
+    # 3) playwright 
     try:
         products = scrape_with_playwright(url)
         if products:
-            return {"url": url, "source": "playwright", "count": len(products), "products": products}
-    except Exception as e:
-        print("Playwright scrape failed:", e)
+            return {
+                "url": url,
+                "source": "playwright_generic",
+                "count": len(products),
+                "products": products,
+            }
+    except Exception:
+        pass
 
     return {"url": url, "source": "none_found", "products": [], "count": 0}
