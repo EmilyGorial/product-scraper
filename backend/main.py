@@ -22,7 +22,7 @@ if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_KEY")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -76,26 +76,135 @@ def extract_price_from_text(text: str):
     return None
 
 
-# playwright scraper
+def fetch_with_webunlocker(url: str) -> str:
+    BD_API_KEY = os.getenv("WEB_UNLOCKER_BRIGHTDATA")
 
+    headers = {
+        "Authorization": f"Bearer {BD_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+    data = {
+    "zone": "shopping_scraper",
+    "url": url,
+    "render": False,       
+    "format": "json"         
+}
+
+
+
+    resp= requests.post(
+        "https://api.brightdata.com/request",
+        json=data,
+        headers=headers
+    )
+
+
+    print("WebUnlocker status:", resp.status_code)
+
+    if resp.status_code != 200:
+        print("WebUnlocker error:", resp.text)
+        return ""
+
+    return resp.json()
+
+def accept_cookies_if_present(page):
+    """Best-effort cookie banner acceptor."""
+    try:
+        # common button texts
+        texts = [
+            "Accept All",
+            "Accept all",
+            "Accept Cookies",
+            "Accept All Cookies"
+            "Accept cookies",
+            "I Agree",
+            "I agree",
+            "Allow all",
+            "Got it",
+            "ACCEPT"
+        ]
+
+        # try main page
+        for txt in texts:
+            btn = page.query_selector(f"button:has-text('{txt}')")
+            if btn:
+                print(f"Clicking cookie button: {txt}")
+                btn.click()
+                page.wait_for_timeout(500)
+                return
+
+        # try generic cookie banner containers
+        possible_selectors = [
+            "[id*='cookie'] button",
+            "[class*='cookie'] button",
+            "div[role='dialog'] button:has-text('Accept')",
+        ]
+        for sel in possible_selectors:
+            btn = page.query_selector(sel)
+            if btn:
+                print(f"Clicking cookie button via selector: {sel}")
+                btn.click()
+                page.wait_for_timeout(500)
+                return
+
+        # try iframes 
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            for txt in texts:
+                btn = frame.query_selector(f"button:has-text('{txt}')")
+                if btn:
+                    print(f"Clicking cookie button in iframe: {txt}")
+                    btn.click()
+                    page.wait_for_timeout(500)
+                    return
+
+        print("No cookie banner found (or already accepted).")
+    except Exception as e:
+        print("Cookie accept failed (ignored):", e)
+
+
+
+# playwright scraper
 def scrape_with_playwright(url: str, max_products: int = 40):
     products = []
     seen_links = set()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=90000)
+    fetch_with_webunlocker(url)
 
-        # wait to settle content
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context_args = {}
+
+        context = browser.new_context(**context_args)
+
+        page = context.new_page()
+
+        page.goto(url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(2000)
 
-        # scroll a bit to trigger lazy loading
+
+        # # Optional debug HTML dump
+        # with open("debug_page.html", "w", encoding="utf-8") as f:
+        #     f.write(page.content())
+
+        # page.screenshot(path="full_page_screenshot.png")
+
+        # scroll for lazy loaded products
         for _ in range(4):
             page.mouse.wheel(0, 2500)
             page.wait_for_timeout(800)
+        
+        accept_cookies_if_present(page)
+        page.wait_for_timeout(1000)
 
+        # debug HTML dump
+        # with open("debug_page.html", "w", encoding="utf-8") as f:
+        #     f.write(page.content())
+
+        
         card_selector = (
             "article, "
             "li[class*='product'], "
@@ -104,9 +213,30 @@ def scrape_with_playwright(url: str, max_products: int = 40):
             "div[data-test*='product'], "
             "li[data-test*='product'],"
             "div[class*='tile'], "
-            "div[class*='card']"
+            "div[class*='card'], "
+            "div.product-detail.product-wrapper"
         )
         card_elements = page.query_selector_all(card_selector)
+
+        # UNIVERSAL_XPATH = """
+        # //div[
+        #     descendant::a[
+        #         contains(@href, "product") or 
+        #         contains(@href, "/p/") or 
+        #         contains(@href, "/products/")
+        #     ]
+        #     and
+        #     descendant::img
+        #     and
+        #     descendant::*[
+        #         contains(text(), "$") or 
+        #         contains(text(), ".")
+        #     ]
+        # ]
+        # """
+
+        # card_elements = page.locator(UNIVERSAL_XPATH).all()
+
 
         if not card_elements:
             browser.close()
@@ -118,7 +248,6 @@ def scrape_with_playwright(url: str, max_products: int = 40):
             if len(products) >= max_products:
                 break
 
-            # product link
             link_el = card.query_selector(
                 "a[href*='product'], "
                 "a[href*='/products/'], "
@@ -140,7 +269,6 @@ def scrape_with_playwright(url: str, max_products: int = 40):
                 continue
             seen_links.add(href)
 
-            # image
             img_el = card.query_selector("img")
             image = None
             if img_el:
@@ -157,7 +285,6 @@ def scrape_with_playwright(url: str, max_products: int = 40):
                         image = image.split("?")[0]
                         break
 
-            # title
             title = None
 
             heading = card.query_selector("h1, h2, h3, h4")
@@ -166,7 +293,7 @@ def scrape_with_playwright(url: str, max_products: int = 40):
                 if t:
                     title = t
 
-            if not title:
+            if not title or title =="Activating this element will cause content on the page to be updated.":
                 name_el = card.query_selector(
                     "[class*='title'], [class*='name'], [data-test*='title']"
                 )
@@ -175,14 +302,14 @@ def scrape_with_playwright(url: str, max_products: int = 40):
                     if t:
                         title = t
 
-            if not title:
+            if not title or  title =="Activating this element will cause content on the page to be updated.":
                 for attr in ["aria-label", "title"]:
                     t = link_el.get_attribute(attr)
                     if t:
                         title = t.strip()
                         break
 
-            if not title:
+            if not title or  title =="Activating this element will cause content on the page to be updated.":
                 t = link_el.inner_text().strip()
                 if t:
                     title = t
@@ -206,165 +333,29 @@ def scrape_with_playwright(url: str, max_products: int = 40):
             if "£" in price:
                 price = price.replace("£", "$")
 
-            products.append(
-                {
-                    "title": title,
-                    "price": price,
-                    "link": href,
-                    "image": image,
-                }
-            )
+            products.append({
+                "title": title,
+                "price": price,
+                "link": href,
+                "image": image,
+            })
+
+            print("used playwright")
 
         browser.close()
+
+        print(products[:5])
+
+        print("browser closed")
 
     return products
 
 
 
-# gemini block based scrape
-
-def extract_product_blocks(url: str):
-    """
-    Return a list of small HTML or JSON-LD snippets that likely represent products.
-    Each item is a tuple: ("html" | "json-ld", content).
-    """
-    resp = requests.get(url, timeout=15, headers={
-        "User-Agent": "Mozilla/5.0"
-    })
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    blocks = []
-
-    # 1) JSON-LD product schema blocks
-    for script in soup.find_all("script", type="application/ld+json"):
-        if not script.string:
-            continue
-        try:
-            data = json.loads(script.string)
-        except Exception:
-            continue
-
-        def handle_json_ld(obj):
-            if not isinstance(obj, dict):
-                return
-            t = obj.get("@type")
-            if t in ["Product", "Offer"]:
-                blocks.append(("json-ld", obj))
-
-        if isinstance(data, list):
-            for item in data:
-                handle_json_ld(item)
-        else:
-            handle_json_ld(data)
-
-    # 2) HTML block candidates via class names
-    candidate_selectors = [
-        "[class*=product]",
-        "[class*=grid]",
-        "[class*=item]",
-        "[class*=tile]",
-        "[class*=card]",
-        "article",
-        "li",
-    ]
-
-    for sel in candidate_selectors:
-        for el in soup.select(sel):
-            text = el.get_text(" ", strip=True)
-            # heuristic: only keep blocks that look price-y
-            if any(word in text.lower() for word in ["$", "price", "sale", "now", "was"]):
-                blocks.append(("html", str(el)))
-
-    # 3) Anchor-based candidates
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if any(x in href for x in ["/product", "/products", "/shop", "/p/"]):
-            parent_html = str(a.parent)
-            blocks.append(("html", parent_html))
-
-    return blocks
+import requests
+import os
 
 
-def gemini_extract_from_block(block, url: str):
-    """
-    Convert one product block into structured product info via Gemini.
-    block is a tuple: ("html" | "json-ld", content)
-    """
-    block_type, content = block
-
-    # JSON-LD: already structured, just normalize
-    if block_type == "json-ld":
-        name = content.get("name")
-        image = content.get("image")
-        if isinstance(image, list):
-            image = image[0] if image else None
-
-        offers = content.get("offers") or {}
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-
-        price_raw = offers.get("price") or offers.get("priceSpecification", {}).get("price")
-        price = extract_price_from_text(str(price_raw)) if price_raw else None
-
-        return {
-            "title": name,
-            "price": price,
-            "link": url,  # JSON-LD often doesn't have deep links; we fall back to page URL
-            "image": image,
-        }
-
-    # HTML: ask Gemini to interpret
-    prompt = f"""
-Extract a single product from the HTML below.
-
-Return ONLY this JSON:
-{{
-  "title": "...",
-  "price": "...",
-  "link": "...",
-  "image": "..."
-}}
-
-Rules:
-- If there is a product link, include it as "link".
-- If the link is relative, resolve it against: {url}
-- "price" should include a currency symbol if present in the HTML.
-- If some field is missing, use null for that field.
-- Do NOT invent products that are not in the HTML.
-
-HTML:
-{content}
-"""
-
-    model = genai.GenerativeModel(
-        "gemini-2.0-flash-lite",
-        generation_config={"response_mime_type": "application/json"},
-    )
-
-    try:
-        out = model.generate_content(prompt).text.strip()
-        data = json.loads(out)
-    except Exception:
-        return None
-
-    # Resolve relative link
-    link = data.get("link") or ""
-    if link.startswith("/"):
-        base = url.split("/")[0] + "//" + url.split("/")[2]
-        link = base + link
-
-    # Normalize price
-    price = data.get("price")
-    if price:
-        price = extract_price_from_text(str(price))
-
-    return {
-        "title": data.get("title"),
-        "price": price,
-        "link": link or url,
-        "image": data.get("image"),
-    }
 
 
 # main scrape endpoint
@@ -415,50 +406,23 @@ def scrape(url: str = Query(...)):
         except Exception:
             pass
 
-    # 2) gemini scrape
-    try:
-        blocks = extract_product_blocks(url)
-        ai_products = []
-        seen_links = set()
-
-        for block in blocks[:20]:  # limit blocks to control cost
-            p = gemini_extract_from_block(block, url)
-            if not p:
-                continue
-            if not p.get("title"):
-                continue
-
-            link = p.get("link")
-            # Deduplicate by link if present
-            if link and link in seen_links:
-                continue
-            if link:
-                seen_links.add(link)
-
-            ai_products.append(p)
-
-        if ai_products:
-            return {
-                "url": url,
-                "source": "gemini_blocks",
-                "count": len(ai_products),
-                "products": ai_products[:40],
-            }
-    except Exception:
-        pass
 
     # 3) playwright fallback
     try:
         products = scrape_with_playwright(url)
         if products:
+            print("we have products")
             return {
                 "url": url,
                 "source": "playwright",
                 "count": len(products),
                 "products": products,
             }
-    except Exception:
-        pass
+    # except Exception:
+    #     pass
+    except Exception as e:
+        print("Playwright error:", e)
+        raise
 
     return {"url": url, "source": "none_found", "count": 0, "products": []}
 
